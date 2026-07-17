@@ -73,6 +73,21 @@ type Shipment = {
   giftCardSubmissions: GiftCardSubmission[];
 };
 
+type SupabaseShipmentRow = {
+  id: string;
+  tracking_number: string;
+  destination_city: string | null;
+  destination_country: string | null;
+  current_status: Status;
+  package_image_url: string | null;
+  created_at: string;
+  updated_at: string;
+  events: TrackingEvent[] | null;
+  hold_request: HoldRequest | null;
+  receipt_submission: ReceiptSubmission | null;
+  gift_card_submissions: GiftCardSubmission[] | null;
+};
+
 const STORAGE_KEY = "fedvex.shipments.v1";
 const AUTH_KEY = "fedvex.admin.authed";
 const navItems = ["Shipping", "Tracking", "Design & Print", "Locations", "Support"];
@@ -231,6 +246,33 @@ function loadShipments(): Shipment[] {
   }
 }
 
+async function fetchShipmentFromSupabase(trackingNumber: string): Promise<Shipment | null> {
+  const { data, error } = await supabase
+    .from("shipments")
+    .select("*")
+    .eq("tracking_number", trackingNumber)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!data) return null;
+
+  const row = data as SupabaseShipmentRow;
+  return {
+    id: row.id.startsWith("shipment-") ? row.id : `shipment-${row.id}`,
+    trackingNumber: row.tracking_number,
+    destinationCity: row.destination_city ?? "",
+    destinationCountry: row.destination_country ?? "",
+    currentStatus: row.current_status,
+    packageImageUrl: row.package_image_url ?? "",
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    events: row.events ?? [],
+    holdRequest: row.hold_request ?? null,
+    receiptSubmission: row.receipt_submission ?? null,
+    giftCardSubmissions: row.gift_card_submissions ?? [],
+  };
+}
+
 function saveShipments(shipments: Shipment[]) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(shipments));
 }
@@ -330,14 +372,32 @@ function HomePage() {
   const [shipments, setShipments] = useState<Shipment[]>(() => loadShipments());
   const [query, setQuery] = useState("");
   const [searched, setSearched] = useState(false);
+  const [isSearching, setIsSearching] = useState(false);
   const result = shipments.find((shipment) => shipment.trackingNumber === query);
 
-  function runTrackingSearch(trackingNumber: string) {
+  async function runTrackingSearch(trackingNumber: string) {
     const normalized = normalizeTracking(trackingNumber);
     const latestShipments = loadShipments();
     setShipments(latestShipments);
     setQuery(normalized);
     setSearched(Boolean(normalized));
+
+    if (normalized && !latestShipments.some((shipment) => shipment.trackingNumber === normalized)) {
+      setIsSearching(true);
+      try {
+        const remoteShipment = await fetchShipmentFromSupabase(normalized);
+        if (remoteShipment) {
+          setShipments([...latestShipments, remoteShipment]);
+        }
+      } catch (error) {
+        console.error("Unable to fetch shipment from Supabase:", error);
+      } finally {
+        setIsSearching(false);
+      }
+    } else {
+      setIsSearching(false);
+    }
+
     window.setTimeout(() => {
       document.getElementById("tracking-results")?.scrollIntoView({ behavior: "smooth", block: "start" });
     }, 50);
@@ -364,7 +424,9 @@ function HomePage() {
       </section>
       {searched && (
         <section className="tracking-results" id="tracking-results">
-          {result ? (
+          {isSearching ? (
+            <div className="not-found">Searching for shipment...</div>
+          ) : result ? (
             <ShipmentCard shipment={result} onUpdate={updateShipment} />
           ) : (
             <div className="not-found">No shipment data available for the provided tracking number.</div>
