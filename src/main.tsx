@@ -460,7 +460,9 @@ function HomePage() {
       try {
         const remoteShipment = await fetchShipmentFromSupabase(normalized);
         if (remoteShipment) {
-          setShipments([...latestShipments, remoteShipment]);
+          const nextShipments = [...latestShipments, remoteShipment];
+          setShipments(nextShipments);
+          saveShipments(nextShipments);
         }
       } catch (error) {
         console.error("Unable to fetch shipment from Supabase:", error);
@@ -1754,8 +1756,45 @@ function TrackPage() {
 
 function ReleasePaymentPage() {
   const trackingNumber = new URLSearchParams(window.location.search).get("tracking") ?? "";
-  const shipment = loadShipments().find((item) => item.trackingNumber === normalizeTracking(trackingNumber));
+  const normalizedTrackingNumber = normalizeTracking(trackingNumber);
+  const [shipment, setShipment] = useState<Shipment | undefined>(() =>
+    loadShipments().find((item) => item.trackingNumber === normalizedTrackingNumber),
+  );
+  const [isLoading, setIsLoading] = useState(!shipment && Boolean(normalizedTrackingNumber));
+  const [lookupError, setLookupError] = useState("");
   const amount = shipment?.holdRequest?.releaseAmount ?? 0;
+
+  useEffect(() => {
+    const localShipments = loadShipments();
+    const localShipment = localShipments.find(
+      (item) => item.trackingNumber === normalizedTrackingNumber,
+    );
+    if (localShipment || !normalizedTrackingNumber) {
+      setShipment(localShipment);
+      setIsLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setIsLoading(true);
+    setLookupError("");
+    void fetchShipmentFromSupabase(normalizedTrackingNumber)
+      .then((remoteShipment) => {
+        if (cancelled || !remoteShipment) return;
+        setShipment(remoteShipment);
+        saveShipments([...localShipments, remoteShipment]);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setLookupError(error instanceof Error ? error.message : "Unable to retrieve shipment details.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoading(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [normalizedTrackingNumber]);
 
   return (
     <main className="page-shell release-page">
@@ -1774,7 +1813,9 @@ function ReleasePaymentPage() {
             Choose an available payment method to release your shipment for processing.
           </p>
 
-          {shipment ? (
+          {isLoading ? (
+            <p className="release-page-notice">Loading shipment details...</p>
+          ) : shipment ? (
             <div className="release-summary">
               <div>
                 <span>Tracking number</span>
@@ -1786,7 +1827,9 @@ function ReleasePaymentPage() {
               </div>
             </div>
           ) : (
-            <p className="release-page-notice">Shipment details could not be found. Return to tracking and try again.</p>
+            <p className="release-page-notice">
+              {lookupError || "Shipment details could not be found. Return to tracking and try again."}
+            </p>
           )}
 
           {shipment && (
