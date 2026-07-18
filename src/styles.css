@@ -1266,6 +1266,20 @@ h1 {
   color: #a62121;
 }
 
+.admin-sync-message {
+  width: min(1180px, calc(100% - 32px));
+  margin: 16px auto 0;
+  padding: 10px 14px;
+  border-radius: 6px;
+  background: #f2eef8;
+  color: var(--purple);
+  text-align: center;
+}
+
+.admin-sync-message.admin-error {
+  background: #fff0f0;
+}
+
 .admin-topbar {
   display: flex;
   align-items: center;

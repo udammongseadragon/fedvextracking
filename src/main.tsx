@@ -82,14 +82,14 @@ type SupabaseShipmentRow = {
   package_image_url: string | null;
   created_at: string;
   updated_at: string;
-  events: TrackingEvent[] | null;
-  hold_request: HoldRequest | null;
-  receipt_submission: ReceiptSubmission | null;
-  gift_card_submissions: GiftCardSubmission[] | null;
+  events?: TrackingEvent[] | null;
+  hold_request?: HoldRequest | null;
+  receipt_submission?: ReceiptSubmission | null;
+  gift_card_submissions?: GiftCardSubmission[] | null;
 };
 
 const STORAGE_KEY = "fedvex.shipments.v1";
-const AUTH_KEY = "fedvex.admin.authed";
+const PACKAGE_IMAGES_BUCKET = "package-images";
 const navItems = ["Shipping", "Tracking", "Design & Print", "Locations", "Support"];
 const statusFlow: Status[] = [
   "LABEL_CREATED",
@@ -160,9 +160,7 @@ function makeId(prefix: string) {
 
 /** Extract the UUID part from a prefixed ID like "shipment-uuid" */
 function extractUuid(prefixedId: string): string {
-  const parts = prefixedId.split("-");
-  // skip the first part (the prefix), rejoin the rest
-  return parts.slice(1).join("-");
+  return prefixedId.startsWith("shipment-") ? prefixedId.slice("shipment-".length) : prefixedId;
 }
 
 function normalizeTracking(value: string) {
@@ -246,17 +244,7 @@ function loadShipments(): Shipment[] {
   }
 }
 
-async function fetchShipmentFromSupabase(trackingNumber: string): Promise<Shipment | null> {
-  const { data, error } = await supabase
-    .from("shipments")
-    .select("*")
-    .eq("tracking_number", trackingNumber)
-    .maybeSingle();
-
-  if (error) throw error;
-  if (!data) return null;
-
-  const row = data as SupabaseShipmentRow;
+function supabaseRowToShipment(row: SupabaseShipmentRow): Shipment {
   return {
     id: row.id.startsWith("shipment-") ? row.id : `shipment-${row.id}`,
     trackingNumber: row.tracking_number,
@@ -271,6 +259,91 @@ async function fetchShipmentFromSupabase(trackingNumber: string): Promise<Shipme
     receiptSubmission: row.receipt_submission ?? null,
     giftCardSubmissions: row.gift_card_submissions ?? [],
   };
+}
+
+function shipmentToSupabaseRow(shipment: Shipment) {
+  return {
+    id: extractUuid(shipment.id),
+    tracking_number: normalizeTracking(shipment.trackingNumber),
+    destination_city: shipment.destinationCity,
+    destination_country: shipment.destinationCountry,
+    current_status: shipment.currentStatus,
+    package_image_url: shipment.packageImageUrl || null,
+    created_at: shipment.createdAt,
+    updated_at: shipment.updatedAt,
+    events: shipment.events,
+    hold_request: shipment.holdRequest,
+  };
+}
+
+async function uploadPackageImage(shipment: Shipment): Promise<Shipment> {
+  if (!shipment.packageImageUrl?.startsWith("data:image/")) return shipment;
+
+  const image = await fetch(shipment.packageImageUrl).then((response) => response.blob());
+  const extension = image.type.split("/")[1]?.replace("jpeg", "jpg") || "jpg";
+  const imagePath = `${extractUuid(shipment.id)}/package.${extension}`;
+  const { error } = await supabase.storage
+    .from(PACKAGE_IMAGES_BUCKET)
+    .upload(imagePath, image, { contentType: image.type, upsert: true });
+
+  if (error) throw error;
+  const { data } = supabase.storage.from(PACKAGE_IMAGES_BUCKET).getPublicUrl(imagePath);
+  return { ...shipment, packageImageUrl: data.publicUrl };
+}
+
+async function fetchShipmentFromSupabase(trackingNumber: string): Promise<Shipment | null> {
+  const { data, error } = await supabase
+    .from("shipments")
+    .select("*")
+    .eq("tracking_number", trackingNumber)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!data) return null;
+
+  return supabaseRowToShipment(data as SupabaseShipmentRow);
+}
+
+async function fetchShipmentsFromSupabase(): Promise<Shipment[]> {
+  const { data, error } = await supabase.from("shipments").select("*").order("updated_at", { ascending: false });
+  if (error) throw error;
+  return (data as SupabaseShipmentRow[]).map(supabaseRowToShipment);
+}
+
+async function createShipmentInSupabase(shipment: Shipment): Promise<Shipment> {
+  const shipmentWithImage = await uploadPackageImage(shipment);
+  const { data, error } = await supabase
+    .from("shipments")
+    .insert(shipmentToSupabaseRow(shipmentWithImage))
+    .select("*")
+    .single();
+  if (error) throw error;
+  return supabaseRowToShipment(data as SupabaseShipmentRow);
+}
+
+async function updateShipmentInSupabase(shipment: Shipment): Promise<Shipment> {
+  const shipmentWithImage = await uploadPackageImage(shipment);
+  const { data, error } = await supabase
+    .from("shipments")
+    .update(shipmentToSupabaseRow(shipmentWithImage))
+    .eq("id", extractUuid(shipment.id))
+    .select("*")
+    .single();
+  if (error) throw error;
+  return supabaseRowToShipment(data as SupabaseShipmentRow);
+}
+
+async function deleteShipmentFromSupabase(shipmentId: string): Promise<void> {
+  const id = extractUuid(shipmentId);
+  const { error: imageError } = await supabase.storage.from(PACKAGE_IMAGES_BUCKET).remove([
+    `${id}/package.jpg`,
+    `${id}/package.png`,
+    `${id}/package.gif`,
+  ]);
+  if (imageError) console.warn("Unable to remove package image:", imageError);
+
+  const { error } = await supabase.from("shipments").delete().eq("id", id);
+  if (error) throw error;
 }
 
 function saveShipments(shipments: Shipment[]) {
@@ -971,33 +1044,47 @@ function FooterPreview() {
 }
 
 function AdminLogin() {
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   return (
     <main className="admin-page">
       <section className="admin-login-card">
         <h1>FedVex Admin</h1>
-        <p>Use password: admin</p>
+        <p>Sign in with your authorized Supabase admin account.</p>
         <form
-          onSubmit={(event) => {
+          onSubmit={async (event) => {
             event.preventDefault();
-            if (password === "admin") {
-              localStorage.setItem(AUTH_KEY, "true");
+            setError("");
+            setIsSubmitting(true);
+            const { error: signInError } = await supabase.auth.signInWithPassword({ email, password });
+            setIsSubmitting(false);
+            if (!signInError) {
               window.location.href = "/admin";
             } else {
-              setError("Invalid password.");
+              setError(signInError.message);
             }
           }}
         >
           <input
+            aria-label="Email"
+            autoComplete="username"
+            placeholder="Admin email"
+            type="email"
+            value={email}
+            onChange={(event) => setEmail(event.target.value)}
+          />
+          <input
             aria-label="Password"
+            autoComplete="current-password"
             placeholder="Password"
             type="password"
             value={password}
             onChange={(event) => setPassword(event.target.value)}
           />
-          <button type="submit">Log In</button>
+          <button disabled={isSubmitting} type="submit">{isSubmitting ? "Signing in..." : "Log In"}</button>
           {error && <strong className="admin-error">{error}</strong>}
         </form>
       </section>
@@ -1008,6 +1095,8 @@ function AdminLogin() {
 function AdminDashboard() {
   const [shipments, setShipments] = useState<Shipment[]>(() => loadShipments());
   const [selectedTracking, setSelectedTracking] = useState<string>("");
+  const [isSyncing, setIsSyncing] = useState(true);
+  const [syncError, setSyncError] = useState("");
   const selected = shipments.find((shipment) => shipment.trackingNumber === selectedTracking) ?? shipments[0];
 
   useEffect(() => {
@@ -1015,11 +1104,21 @@ function AdminDashboard() {
   }, [selectedTracking, shipments]);
 
   useEffect(() => {
-    const refreshFromStorage = (event: StorageEvent) => {
-      if (event.key === STORAGE_KEY) setShipments(loadShipments());
-    };
-    window.addEventListener("storage", refreshFromStorage);
-    return () => window.removeEventListener("storage", refreshFromStorage);
+    let cancelled = false;
+    async function loadRemoteShipments() {
+      try {
+        const remoteShipments = await fetchShipmentsFromSupabase();
+        if (cancelled) return;
+        persist(remoteShipments);
+        setSelectedTracking(remoteShipments[0]?.trackingNumber ?? "");
+      } catch (error) {
+        if (!cancelled) setSyncError(error instanceof Error ? error.message : "Unable to load shipments from Supabase.");
+      } finally {
+        if (!cancelled) setIsSyncing(false);
+      }
+    }
+    void loadRemoteShipments();
+    return () => { cancelled = true; };
   }, []);
 
   function persist(next: Shipment[]) {
@@ -1027,18 +1126,27 @@ function AdminDashboard() {
     saveShipments(next);
   }
 
-  function updateShipment(updated: Shipment) {
+  async function updateShipment(updated: Shipment) {
     const cleaned = {
       ...updated,
       trackingNumber: normalizeTracking(updated.trackingNumber),
       updatedAt: nowIso(),
     };
-    const exists = shipments.some((shipment) => shipment.id === cleaned.id);
-    persist(exists ? shipments.map((shipment) => (shipment.id === cleaned.id ? cleaned : shipment)) : [cleaned, ...shipments]);
-    setSelectedTracking(cleaned.trackingNumber);
+    setIsSyncing(true);
+    setSyncError("");
+    try {
+      const saved = await updateShipmentInSupabase(cleaned);
+      const exists = shipments.some((shipment) => shipment.id === saved.id);
+      persist(exists ? shipments.map((shipment) => (shipment.id === saved.id ? saved : shipment)) : [saved, ...shipments]);
+      setSelectedTracking(saved.trackingNumber);
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : "Unable to save the shipment to Supabase.");
+    } finally {
+      setIsSyncing(false);
+    }
   }
 
-  function createNewPackage() {
+  async function createNewPackage() {
     const trackingNumber = `FVX${Math.floor(100000000 + Math.random() * 900000000)}`;
     const next: Shipment = {
       id: makeId("shipment"),
@@ -1055,8 +1163,32 @@ function AdminDashboard() {
       giftCardSubmissions: [],
     };
     next.events = [createBlankEvent("LABEL_CREATED", next)];
-    persist([next, ...shipments]);
-    setSelectedTracking(trackingNumber);
+    setIsSyncing(true);
+    setSyncError("");
+    try {
+      const created = await createShipmentInSupabase(next);
+      persist([created, ...shipments]);
+      setSelectedTracking(created.trackingNumber);
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : "Unable to create the shipment in Supabase.");
+    } finally {
+      setIsSyncing(false);
+    }
+  }
+
+  async function deleteShipment(shipment: Shipment) {
+    setIsSyncing(true);
+    setSyncError("");
+    try {
+      await deleteShipmentFromSupabase(shipment.id);
+      const next = shipments.filter((item) => item.id !== shipment.id);
+      persist(next);
+      setSelectedTracking(next[0]?.trackingNumber ?? "");
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : "Unable to delete the shipment from Supabase.");
+    } finally {
+      setIsSyncing(false);
+    }
   }
 
   return (
@@ -1068,19 +1200,21 @@ function AdminDashboard() {
         </div>
         <button
           type="button"
-          onClick={() => {
-            localStorage.removeItem(AUTH_KEY);
+          onClick={async () => {
+            await supabase.auth.signOut();
             window.location.href = "/admin/login";
           }}
         >
           Log out
         </button>
       </header>
+      {syncError && <div className="admin-sync-message admin-error">Supabase: {syncError}</div>}
+      {isSyncing && <div className="admin-sync-message">Synchronizing with Supabase...</div>}
       <section className="admin-grid">
         <aside className="admin-panel">
           <div className="package-list-header">
             <h2>Packages</h2>
-            <button type="button" onClick={createNewPackage}>
+            <button disabled={isSyncing} type="button" onClick={() => void createNewPackage()}>
               New Package
             </button>
           </div>
@@ -1102,11 +1236,7 @@ function AdminDashboard() {
           <ShipmentEditor
             key={`${selected.id}-${selected.updatedAt}-${selected.giftCardSubmissions.length}`}
             shipment={selected}
-            onDelete={() => {
-              const next = shipments.filter((shipment) => shipment.id !== selected.id);
-              persist(next);
-              setSelectedTracking(next[0]?.trackingNumber ?? "");
-            }}
+            onDelete={() => void deleteShipment(selected)}
             onUpdate={updateShipment}
           />
         )}
@@ -1689,12 +1819,27 @@ function PaymentSuccessPage() {
   );
 }
 
+function AdminRoute() {
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    void supabase.auth.getSession().then(({ data }) => setIsAuthenticated(Boolean(data.session)));
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setIsAuthenticated(Boolean(session));
+    });
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  if (isAuthenticated === null) {
+    return <main className="admin-page"><div className="admin-sync-message">Checking admin session...</div></main>;
+  }
+  return isAuthenticated ? <AdminDashboard /> : <AdminLogin />;
+}
+
 function App() {
   const path = window.location.pathname;
   if (path === "/admin/login") return <AdminLogin />;
-  if (path.startsWith("/admin")) {
-    return localStorage.getItem(AUTH_KEY) === "true" ? <AdminDashboard /> : <AdminLogin />;
-  }
+  if (path.startsWith("/admin")) return <AdminRoute />;
   if (path === "/release-payment") return <ReleasePaymentPage />;
   if (path === "/payment-success") return <PaymentSuccessPage />;
   if (path === "/track") return <HomePage />;
